@@ -8,6 +8,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <stdalign.h>
 
 // -=*##############*=-
 //    PRIVATE THINGS
@@ -32,6 +33,8 @@ static const size_t sizeClasses[] = {
 #define ALIGN_UP(x,a) \
     (((uintptr_t)(x) + ((uintptr_t)(a) - 1)) & ~((uintptr_t)(a) - 1))
 
+// Pages that the GC uses to store memory acts as a linked list
+// pages are split into blocks that the GC manages
 typedef struct Page{
     // pointer to arena buffer
     void *block;
@@ -49,6 +52,8 @@ typedef struct Page{
     struct Page *nextPage;
 } Page;
 
+// Book is used to store a list of linked lists of pages
+// also stores chache of emptyPages when freeMemory is not true along with a total number of pages managed
 typedef struct Book{
     // Pages
     Page *classPages[NUM_CLASSES];  // list of pointera for each class size
@@ -57,14 +62,23 @@ typedef struct Book{
     int numPages;
 } Book;
 
+// Workitem stores a page and index within that page for the GC
 typedef struct WorkItem{
     Page *page;
     uint32_t idx;
 } WorkItem;
 
+// Main GC object
+// - stores a book for pages of memory
+// - stores a pointer to the Underlying Arena used for memory
+// - stores a linked list of explicit roots
+// - stores current pressure stats on the GC so it can automatically trigger a collection
 typedef struct GC{
     // where the stack's top should be
     const void *stack_top_hint; // has to be before where the program begins in main()
+
+    // whether to keep all normal objects in the arena or ot use aligned_alloc and free
+    bool freeMemory;
 
     // shunting arena
     Arena *arena;
@@ -101,6 +115,7 @@ static GC gc;
 // Hash Table & Helpers
 // ====================
 
+// Performs a SplitMix64 like hash on a given address
 static inline uint64_t hash64(uint64_t x){
     // SplitMix64-ish hashing
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
@@ -110,6 +125,7 @@ static inline uint64_t hash64(uint64_t x){
     return x;
 }
 
+// Initializes page indexes used for hash table of pages
 static void pageIndexInit(size_t cap){
     if(cap < 64) cap = 64;
     // round to power of two
@@ -130,6 +146,7 @@ static void pageIndexInit(size_t cap){
     }
 }
 
+// Frees page indexes for hash map
 static void pageIndexFree(){
     free(pageIndexKeys);
     pageIndexKeys = NULL;
@@ -140,6 +157,9 @@ static void pageIndexFree(){
     pageIndexCap = pageIndexCnt = 0;
 }
 
+// Grows page indexes
+// minimum of 128, doubles every time more are needed
+// moves all old hashes into new one
 static void pageIndexGrow(){
     // save all current values in temp variables
     size_t oldCap = pageIndexCap;
@@ -173,6 +193,7 @@ static void pageIndexGrow(){
     free(oldVals);
 }
 
+// Inserts a page into the hash
 static void pageIndexInsert(Page *page){
     // get pointer to base of page block
     uintptr_t base = (uintptr_t)page->block;
@@ -200,6 +221,58 @@ static void pageIndexInsert(Page *page){
     pageIndexVals[pos] = page;
 }
 
+// removes a page from the hashes and moves other pages based on new free indexes
+static void pageIndexRemove(void *basePtr){
+    if(pageIndexCap == 0) \
+        return;
+    uintptr_t base = (uintptr_t)basePtr;
+    // in case it wasn't apparent logical and with index cap - 1 is the same as just a %
+    size_t mask = pageIndexCap - 1;
+    size_t pos = (size_t)hash64(base) & mask;
+
+    while(pageIndexKeys[pos]){
+        if(pageIndexKeys[pos] == base){ // if we hash to the correct block
+            // clear values
+            pageIndexKeys[pos] = 0;
+            pageIndexVals[pos] = NULL;
+            pageIndexCnt--;
+
+            // get new page
+            size_t next = (pos + 1) & mask;
+            while(pageIndexKeys[next]){
+                // save
+                uintptr_t key = pageIndexKeys[next];
+                Page *val = pageIndexVals[next];
+
+                // remove
+                pageIndexKeys[next] = 0;
+                pageIndexVals[next] = NULL;
+                pageIndexCnt--;
+
+                // get new location
+                size_t page = (size_t)hash64(key) & mask;
+                while(pageIndexKeys[page]) \
+                    page = (page + 1) & mask;
+
+                // reinsert
+                pageIndexKeys[page] = key;
+                pageIndexVals[page] = val;
+                pageIndexCnt++;
+
+                // get next page
+                next = (next + 1) & mask;
+            }
+            gc.book.numPages--;
+
+            return; // exit finishing successfully
+        }
+        // try next position to try to find correct page
+        pos = (pos + 1) & mask;
+    }
+    
+}
+
+// Returns pointer to a page based off of a pointer to a block of memory
 static Page *pageIndexFindByAddr(void *p){
     if(pageIndexCap == 0) \
         return NULL;
@@ -230,10 +303,12 @@ static Page *pageIndexFindByAddr(void *p){
 // Bit Helpers
 // ===========
 
+// Shifts a bit into a byte
 static inline size_t bitByte(size_t i){
     return i >> 3;
 }
 
+// Returns the bitmask of a given byte
 static inline uint8_t bitMask(size_t i){
     return (uint8_t)(1u << (i & 7));
 }
@@ -242,10 +317,12 @@ static inline uint8_t bitMask(size_t i){
 // Slot Alignment
 // ==============
 
+// Returns a pointer to the base of the slot in given page at the given index
 static inline void *slotBase(Page *page, uint32_t idx){
     return (void *)((uintptr_t)page->block + (uintptr_t)idx * page->sizeClass);
 }
 
+// Returns a pointer to a slot based off of the given page and index
 static inline int32_t *slotNextPtr(Page *page, uint32_t idx){
     return (int32_t *)slotBase(page, idx);
 }
@@ -254,6 +331,8 @@ static inline int32_t *slotNextPtr(Page *page, uint32_t idx){
 // Pages Management
 // ================
 
+// Returns an index for the sizeClasses array that corresponds to the size of slot needed
+// returns -1 if size does not fit into any page class
 static int classForSize(size_t size){
     for(int i = 0; i < (int)NUM_CLASSES; i++){
         if(size <= sizeClasses[i]){
@@ -265,6 +344,8 @@ static int classForSize(size_t size){
     return -1;
 }
 
+// Initializes a page for a given class size and returns a pointer to said page
+// allocates BUFF_SIZE block of memory needed and breaks it up into sizeClass slots
 static Page *pageInitForClass(int classIndex){
     Page *page = malloc(sizeof(Page));
     if(page == NULL){
@@ -274,9 +355,10 @@ static Page *pageInitForClass(int classIndex){
         exit(52);
     }
 
-    // over allocate to force BUFF_SIZE alignment
-    size_t need = BUFF_SIZE + (BUFF_SIZE - 1);
-    void *raw = arenaLocalAlloc(gc.arena, need);
+    // allocate raw data for page block aligned to buffsize from arena or regular memory pool based on settings
+    void *raw;
+    raw = gc.freeMemory ? aligned_alloc(BUFF_SIZE, BUFF_SIZE) : arenaLocalAllocBuffsizeBlock(gc.arena);
+    assert((((uintptr_t)raw) & (BUFF_SIZE - 1)) == 0 && "page not BUFF_SIZE-aligned");
     if(raw == NULL){
         perror("[FATAL]: Could not allocate Page block.");
         free(page);
@@ -284,10 +366,9 @@ static Page *pageInitForClass(int classIndex){
 
         exit(53);
     }
-    void *aligned = (void*)ALIGN_UP(raw, BUFF_SIZE);
 
     // initialize page
-    page->block = aligned;
+    page->block = raw;
     page->sizeClass = sizeClasses[classIndex];
     page->nslots = (uint32_t)(BUFF_SIZE / page->sizeClass);
     page->inuseCount = 0;
@@ -317,6 +398,7 @@ static Page *pageInitForClass(int classIndex){
     return page;
 }
 
+// Resets and clears all data associated with a page and prepares it to hold a different size class of objects
 static void pageResetForClass(Page *page, int classIndex){
     // base address and index entry remain valid
     page->sizeClass = sizeClasses[classIndex];
@@ -345,8 +427,18 @@ static void pageResetForClass(Page *page, int classIndex){
     }
 }
 
+// Destroys all metadata for a given page
+// removes page from lookup hash
+// if freeMemory togle is enabled then the memory if freed aswell
 static void pageDestroyMeta(Page *page){
-    // page->block memory stays in the arena
+    // remove from hash
+    if(page->block) \
+        pageIndexRemove(page->block);
+
+    // page->block memory stays in the arena in arena mode
+    if(gc.freeMemory && page->block) \
+        free(page->block);
+
     free(page->inuseBits);
     free(page->markBits);
     page->block = NULL;
@@ -364,6 +456,7 @@ static void pageDestroyMeta(Page *page){
 // Book Management
 // ===============
 
+// initializes a book for use in GC
 static void bookInit(Book *book){
     for(size_t i = 0; i < NUM_CLASSES; i++){
         book->classPages[i] = NULL;
@@ -373,6 +466,7 @@ static void bookInit(Book *book){
     book->numPages = 0;
 }
 
+// Destroys a list of pages
 static void pagesDestroyList(Page *pages){
     for(Page *page = pages; page != NULL;){
         Page *next = page->nextPage;
@@ -381,6 +475,7 @@ static void pagesDestroyList(Page *pages){
     }
 }
 
+// Destorys a book and all pages it contains
 static void bookDestroy(Book *book){
     for(size_t i = 0; i < NUM_CLASSES; i++){
         pagesDestroyList(book->classPages[i]);
@@ -396,6 +491,8 @@ static void bookDestroy(Book *book){
 // Roots Array
 // ===========
 
+// Adds an explicit root to the list of roots
+// anything that is added will not be freed by the GC until it is unmarked
 static void addRoot(void **root){
     // if roots array is empty
     if(gc.rootsLen == 0){
@@ -439,6 +536,7 @@ static void addRoot(void **root){
     gc.rootsLen++;
 }
 
+// Removes an explicit root based off of it's address
 static bool removeRoot(void **root){
     // search to find the root
     for(size_t i = 0; i < gc.rootsLen; i++){
@@ -458,6 +556,7 @@ static bool removeRoot(void **root){
 // Pressure Based Auto Collect
 // ===========================
 
+// Computes the number of bytes that the GC is currently managing and are active
 static size_t recomputeLiveBytes(){
     size_t live = 0;
 
@@ -470,6 +569,7 @@ static size_t recomputeLiveBytes(){
     return live;
 }
 
+// computes whether the GC should collect based on current pressure stats
 static inline void maybeCollectOnPressure(size_t upcomingAllocBytes){
     size_t baseline = gc.lastLiveBytes ? gc.lastLiveBytes : BUFF_SIZE;
     size_t threshold = (size_t)(baseline * gc.growthFactor);
@@ -484,6 +584,8 @@ static inline void maybeCollectOnPressure(size_t upcomingAllocBytes){
 // Allocation Helpers
 // ==================
 
+// Allocates memory to any empty page slots in size class or makes a new page
+// computes whether or not a collection is necessary and increments bytes since last gc
 static void *allocFromClass(int classIndex){
     // check pressure before considering new pages
     maybeCollectOnPressure(sizeClasses[classIndex]);
@@ -554,7 +656,9 @@ static void *allocFromClass(int classIndex){
 // ==============================
 
 static void markPtr(void *ptr);
+// fwd declaration
 
+// Walks the stack and casts everything to a pointer then tries to mark anything it manages
 static void scanStackForRoots(){
     volatile int here;  // try to flush all registers by adding a volatile to the stack
 
@@ -572,6 +676,7 @@ static void scanStackForRoots(){
     }
 }
 
+// Walks explicit root list and makes sure to mark anything that still exists
 static void markFromExplicitRoots(){
     // walk the declared roots
     for(size_t r = 0; r < gc.rootsLen; r++){
@@ -586,7 +691,7 @@ static void markFromExplicitRoots(){
     }
 }
 
-// compute base with mask & look up in index
+// Compute base with mask & look up in index
 static Page *findPageContaining(void *p, uint32_t *outIdx){
     // if passed pointer is invalid
     if(p == NULL) \
@@ -614,6 +719,7 @@ static Page *findPageContaining(void *p, uint32_t *outIdx){
     return page;
 }
 
+// Adds an item to a worklist so the GC can act on it durring sweep phase
 static void wlPush(Page *page, uint32_t idx){
     // grow the worklist array
     if(workLen == workCap){
@@ -639,6 +745,7 @@ static void wlPush(Page *page, uint32_t idx){
     workLen++;
 }
 
+// Attempts to mark a slot managed by GC based on given page and index
 static int slotMark(Page *page, uint32_t idx){
     // get markBit and bitmask for the index
     uint8_t *mb = &page->markBits[bitByte(idx)];
@@ -652,6 +759,8 @@ static int slotMark(Page *page, uint32_t idx){
     return 1;
 }
 
+// Attempts to mark a slot on a page based off of a pointer
+// finds out whether page contains a pointer then makes an attempt to mark the correspondind slot in the page
 static void markPtr(void *ptr){
     // get page based off of pointer
     uint32_t idx = 0;
@@ -669,6 +778,7 @@ static void markPtr(void *ptr){
     }
 }
 
+// Executes everything on the worklist
 static void traceWorklist(){
     // walk the worklist
     while(workLen){
@@ -691,6 +801,7 @@ static void traceWorklist(){
 // Sweeping
 // ========
 
+// "frees" a slot and allows it to be reused in that page
 static void freeSlot(Page *page, uint32_t idx){
     // push slot back to freelist
     *slotNextPtr(page, idx) = page->freeHead;
@@ -702,6 +813,9 @@ static void freeSlot(Page *page, uint32_t idx){
         page->inuseCount--;
 }
 
+// Walks the list of pages and checks for any extra pointers to memory slots
+// frees anything that is not in use
+// if a page is empty after this process the GC either frees it or returns it to emptyPages list to be reused
 static void sweepAllPages(){
     // for every class size
     for(size_t c = 0; c < NUM_CLASSES; c++){
@@ -727,13 +841,17 @@ static void sweepAllPages(){
                 // unlink from class list
                 *link = page->nextPage;
 
-                // move to emptyPages cache
-                page->nextPage = gc.book.emptyPages;
-                gc.book.emptyPages = page;
+                // move to emptyPages cache or free if freeing
+                if(gc.freeMemory){
+                    pageDestroyMeta(page);
+                }
+                else{
+                    page->nextPage = gc.book.emptyPages;
+                    gc.book.emptyPages = page;
+                }
+                continue;
             }
-            else{
-                link = &page->nextPage; // get next page
-            }
+            link = &page->nextPage; // get next page
         }
     }
 }
@@ -746,6 +864,8 @@ static void sweepAllPages(){
 // Debug
 // =====
 
+// Will print basic info about the internal state of the GC
+// prints current inuse pageCount empty pageCount last bytes...
 void gcDebugPrintStats(){
     size_t totalPages = 0;  // active + empty
     size_t activePages = 0; // pages currently in class lists
@@ -775,9 +895,17 @@ void gcDebugPrintStats(){
 // Initialize & Destroy GC
 // =======================
 
-bool gcInit(const void *stack_top_hint){
+// Initializes the GC and returns a bool to indicate whether initialization succeded
+// stack_top_hint is the address of a variable in main() ex:`&stackTop` used to scan the stack for memory addresses
+// freeMemory is a boolean used to togle between GC collection behavior
+// - if true the GC will free empty pages upon collect
+// - if false the GC will save empty pages in the arena and cached in a list for reuse
+bool gcInit(const void *stack_top_hint, bool freeMemory){
     // store address of approximately where the stack top would be
     gc.stack_top_hint = stack_top_hint;
+
+    // store whether or not we are going to be using the arena for everything
+    gc.freeMemory = freeMemory;
 
     // start the arena
     gc.arena = arenaLocalInit();
@@ -801,6 +929,7 @@ bool gcInit(const void *stack_top_hint){
     return true;
 }
 
+// Destroys the GC and arena it controlls, frees any associated memory
 void gcDestroy(){
     // if the GC was initialized (based on whether the arena is valid)
     if(gc.arena){
@@ -829,6 +958,7 @@ void gcDestroy(){
 // Explicit Collect & Rooting
 // ==========================
 
+// Manually trigger a collection from the GC to get more usable memory
 void gcCollect(){
     // mark
     workLen = 0; // reset worklist (capacity kept)
@@ -844,12 +974,14 @@ void gcCollect(){
     gc.bytesSinceLastGC = 0;
 }
 
+// Manually root a variable for safety so that the GC will not free it until unrooted
 void gcRootVariable(void **addr){
     // add root based on explicit address
     if(addr) \
         addRoot(addr);
 }
 
+// Manually root a variable for safety so that the GC will then be able to free it on next collect
 void gcUnrootVariable(void **addr){
     // remove the root based on explicit address
     if(!addr || !removeRoot(addr)){
@@ -861,6 +993,8 @@ void gcUnrootVariable(void **addr){
 // Alloc
 // =====
 
+// Allocates a `size` block of memory and returns a pointer to the base of it
+// - any blocks to large to fit into GC pages will be allocated to an underlying arena these blocks will not be freed until the GC is destroyed
 void *gcAlloc(size_t size){
     int classIndex = classForSize(size);
     if(classIndex < 0){
