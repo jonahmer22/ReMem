@@ -166,7 +166,7 @@ You can also see `./testing/testing.c` for a more in depth example (used to benc
 
 int main(int argc, char **argv){
     int stackTop;   // put any variable on the stack as a hint for where to start
-    gcInit(&stackTop);  // initialize the GC by passing the address of the stack hint
+    gcInit(&stackTop, false); // initialize the GC by passing the address of the stack hint & whether or not to free memory
 
     // proceed to use the gcAlloc() function as a drop in for malloc() without any accompanying free
     int *arr = gcAlloc(sizeof(int) * 1024);
