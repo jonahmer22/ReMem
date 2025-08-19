@@ -180,5 +180,6 @@ The below listed functionality are things I plan to eventually add to this libra
 - Nursery: Add in Nursery support alongside current functionality. There should be a 1.5-5x speedup from implementing and using this (this is an estimate though).
 - Multithreading: Allow for Multithreaded applications (long term goal).
 
+See the [changelog](CHANGELOG) for more info in recent changes.
 ## License
 [GPL v3.0](LICENSE)
