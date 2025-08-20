@@ -119,7 +119,7 @@ it is best to use `freeMemory` only when your program is long living and RSS is 
 
 *The "underlying arena" is the shunting arena that provides the GC with memory (when it has large objects or freeMemory is false), this arena ships with this library and can be found at `./arena/`. Please note that this arena is also licensed under [GPL v3.0](LICENSE) and can be found on my github page.
 #### Basics of using Arena
-Please read the source or see my github repo for more in depth instructions.
+Please read the source or see my github repo on the [arena](https://github.com/jonahmer22/arena/) for more in depth instructions.
 - `arenaInit()`: initializes the global arena.
 - `arenaAlloc(size_t size)`: allocates a `size` sized block of memory from the arena. 
 - `arenaDestroy()`: destroys and frees all memory associated with the arena.
