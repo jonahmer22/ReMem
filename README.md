@@ -1,10 +1,10 @@
 # ReMem - High-Performance Memory Recycler & Garbage Collector for C
 
-ReMem is a lightweight, high performance memory recycler & garbage collector for single threaded* C.  
+ReMem is a lightweight, high performance memory recycler & garbage collector for single threaded C*.  
 It reuses and releases freed memory through size classed arenas and O(1) page indexing, reducing allocation overhead and fragmentation for predictable, GC free performance.
 
 ---
-*multithreading support is planned for the future, see roadmap
+*multithreading support is planned for the future, see roadmap or [changelog](CHANGELOG.md)
 
 ## Features
 - Size classed allocation for fast lookups
@@ -30,12 +30,88 @@ This library has been tested on the following architectures:
 - Via Nano x86-64
 
 ## Performance
-TLDR: for peak performance use without freeMemory so you can take advantage of caching of free pages. This library is slower than manualy using malloc and free and has a slightly larger memory footprint (obviously), but roughly ~8-9x quicker than interpreted languages with a gc like python.
+TLDR: for peak performance use without freeMemory so you can take advantage of caching of free pages. This library is slower than manualy using malloc and free and has a slightly larger memory footprint (obviously), but roughly ~8-9x quicker than interpreted languages with a gc like python on less performant hardware.
 
 This test was ran to assess speed and effectiveness of the GC to decrease total runtime footprint of a program that uses ~16GB of memory over it's lifetime.
 
 ##### NOTE: (RSS roughly translates to peak memory footprint)
-#### Hardware aknowledgement
+### There are two seperate sections for performance to attempt to show performance on different "classes" of devices.
+*Basically a high performance machine VS a low performace machine. Please note as demonstrated by the different test cases that performance can vary from platform to platform, and build flags might adversely effect a platforms abaility to automatically collect memory.*
+
+Hardware aknowledgement for high performance devices
+---
+This test was ran on modern performant hardware, but for the sake of clarity & reference the relevant specs are listed below (courtesy of fastfetch). Please note that your results may differ based on factors like hardware, os, and build flags.
+- Host: MacBook Pro (16-inch, Nov 2023)
+- Kernel: Darwin 25.0.0
+- CPU: Apple M3 Pro (12) @ 4.06 GHz
+- Memory: 36.00 GiB
+- Swap: Disabled
+
+### Plain malloc & free
+```
+-======-
+malloc/free
+  time:           2.141 s
+  total alloc:    16802553016 B
+  dropped/freed:  16802553016 B
+  peak RSS:       20256 KB
+```
+Plain malloc and free completed the test in ~2 seconds with a RSS of ~20MB. This will be used as a baseline of comparison for all other measurements.
+### ReMem without freeing
+```
+-======-
+ReMem GC (freeMemory=false)
+  time:           2.965 s
+  total alloc:    16799397816 B
+  dropped/freed:  16799397816 B
+  peak RSS:       19248 KB
+```
+Without freeing (allowing the GC to "cache" empty pages) the GC performed the test in ~3 seconds with a RSS of ~19MB.
+#### Compared to malloc & free
+- 1.39x longer execution time
+- 0.95x larger RSS
+### ReMem with freeing
+```
+-======-
+ReMem GC (freeMemory=true)
+  time:           2.966 s
+  total alloc:    16796637656 B
+  dropped/freed:  16796637656 B
+  peak RSS:       19136 KB
+```
+While allowing the GC to free pages back to the memory pool the GC performed the test in ~3 seconds with a RSS of ~19MB.
+#### Compared to malloc & free
+- 1.39x longer execution time
+- 0.94x larger RSS
+### Shunting arena
+```
+-======-
+arena-only (arenaAlloc)
+  time:           1.610 s
+  total alloc:    16796291808 B
+  dropped/freed:  16796291808 B
+  peak RSS:       16488272 KB
+```
+While using purely the "underlying arena"* the test completed in ~2 seconds and had an RSS of ~16GB
+#### Compared to malloc & free
+- 0.75x longer execution time
+- 833530.34x larger RSS
+### Python
+```
+-======-
+Python (reference workload)
+  time:           37.655 s
+  total alloc:    16,805,727,608 B
+  dropped/freed:  16,805,727,608 B
+  peak RSS:       13,728 KB
+```
+Under the interpreted language python this test completed in ~38 seconds with a RSS of ~14MB
+#### Compared to malloc & free
+- 17.59x longer execution time
+- 0.68x larger RSS
+
+Hardware aknowledgement for low performance devices
+---
 This test was ran on fairly low-end hardware, but for the sake of clarity & reference the relevant specs are listed below (courtesy of fastfetch). Please note that your results may differ based on factors like hardware, os, and build flags.
 - Host: HP Laptop 14-ep2xxx
 - Kernel: Linux 6.15.9
@@ -91,7 +167,7 @@ arena-only (arenaAlloc)
 While using purely the "underlying arena"* the test completed in ~19 seconds and had an RSS of ~12GB
 #### Compared to malloc & free
 - 4.58x longer execution time
-- 4851.20x larger RSS
+- 4967624.35x larger RSS
 ### Python
 ```
 -======-
@@ -106,11 +182,14 @@ Under the interpreted language python this test completed in ~81 seconds with a 
 - 19.23x longer execution time
 - 4.43x larger RSS
 
+---
 ### Conclusion
 While using a GC in C cannot possibly be quicker or more efficient than manual memory management, with proper settings and setup a program can gain the feature of GC from interpreted languages without the slowdown associated. 
 
 #### Recomendations
 If you do not want to manually manage memory I recommend to use this library with the `freeMemory` togled to false, there is no significant impact on RSS by enabling it and it is ~4x quicker without it. For short lived programs where pausing to do a GC sweep is not permissable use the underlying arena detailed below. 
+
+Note please look at your targeted CPU specifications such as architecture, extensions, and memory bandwidth. The performance disparity between high performance and low is most likely due to architecture changes and added extensions.
 
 ##### When to use `freeMemory` then?
 it is best to use `freeMemory` only when your program is long living and RSS is important or when system resources are verifiably low and reliable time sensetive alloc speeds are not absolutely necessary.
